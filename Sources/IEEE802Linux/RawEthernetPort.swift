@@ -24,6 +24,7 @@ import IEEE802
 import IORing
 import IORingUtils
 import SocketAddress
+import Synchronization
 import struct SystemPackage.Errno
 
 // Ethernet header (destination, source, EtherType) plus room for one 802.1Q tag.
@@ -229,77 +230,56 @@ public struct EthernetInterface: Sendable, CustomStringConvertible {
   }
 }
 
+// io_uring buffers provided to receive frames into
+private let _receiveBufferCount = 32
+// frames queued for a receiver that isn't keeping up, beyond which newer frames are dropped
+private let _receiveQueueLength = 256
+
 /// Sends and receives raw Ethernet frames on one interface using AF_PACKET sockets and io_uring.
+///
+/// A port sends and receives on one packet socket. The kernel never loops a frame back to the
+/// packet socket that sent it (dev_queue_xmit_nit() skips it), so a port receives the frames other
+/// sockets and processes on this host send on the interface, which the kernel marks
+/// PACKET_OUTGOING, but not its own. A socket filter can't tell senders apart, so this relies on
+/// the socket being shared: its receivers are demultiplexed in userspace.
 public final class RawEthernetPort: Sendable, CustomStringConvertible {
   public let interface: EthernetInterface
 
-  private let _ring: IORing
-  private let _txSocket: Socket
+  private let _socket: _PacketSocket
 
   public init(interface: EthernetInterface, ring: IORing = .shared) throws {
     self.interface = interface
-    _ring = ring
-    _txSocket = try Socket(
-      ring: ring,
-      domain: sa_family_t(AF_PACKET),
-      type: SOCK_RAW,
-      protocol: 0
-    )
+    _socket = try _PacketSocket(interface: interface, ring: ring)
   }
 
   public convenience init(name: String, ring: IORing = .shared) throws {
     try self.init(interface: EthernetInterface(name: name), ring: ring)
   }
 
+  deinit {
+    _socket.portReleased()
+  }
+
   public var description: String {
     "RawEthernetPort(\(interface))"
   }
 
-  /// Opens a receive socket that only sees frames with one of `etherTypes`, and joins each of
-  /// `groupAddresses` so that the device's multicast filter (and any hardware-offloaded bridge
-  /// MDB) forwards them, without resorting to promiscuous mode. `subtypes` further restricts an
-  /// EtherType to frames whose first payload octet is in one of its ranges; see
+  /// Receives the frames with one of `etherTypes`, joining each of `groupAddresses` so that the
+  /// device's multicast filter (and any hardware-offloaded bridge MDB) forwards them, without
+  /// resorting to promiscuous mode. `subtypes` further restricts an EtherType to frames whose first
+  /// payload octet is in one of its ranges; see
   /// `makeEtherTypeFilter(etherTypes:subtypes:dropsVLANTagged:dropsOutgoing:)`.
+  ///
+  /// Frames sent by other sockets on this host are received, but not those this port sends. The
+  /// groups are left when the sequence ends or its consumer stops iterating it. An error on the
+  /// socket, such as the interface going down, ends every sequence of this port with that error.
   public func receivePackets(
     etherTypes: [UInt16],
     groupAddresses: [EUI48],
     subtypes: [UInt16: [ClosedRange<UInt8>]] = [:]
   ) async throws -> AnyAsyncSequence<IEEE802Packet> {
-    // open with protocol 0 and attach the BPF before bind() enables capture, so no unfiltered
-    // frames leak in the socket()->attachFilter() window
-    let rxSocket = try Socket(
-      ring: _ring,
-      domain: sa_family_t(AF_PACKET),
-      type: SOCK_RAW,
-      protocol: 0
-    )
-    try rxSocket.attachFilter(makeEtherTypeFilter(etherTypes: etherTypes, subtypes: subtypes))
-    try rxSocket.bind(to: makeLinkLayerAddress(
-      macAddress: interface.macAddress,
-      etherType: UInt16(ETH_P_ALL),
-      packetType: UInt8(PACKET_MULTICAST),
-      index: interface.index
-    ))
-    for groupAddress in groupAddresses {
-      try rxSocket.addMulticastMembership(for: makeLinkLayerAddress(
-        macAddress: groupAddress,
-        index: interface.index
-      ))
-    }
-
-    // io_uring requires the buffer size to be aligned to its recvmsg header
-    let alignment = MemoryLayout<UInt64>.alignment
-    let frameSize = interface.mtu + _ethernetHeaderLength + _vlanTagLength
-    let count = (frameSize + alignment - 1) / alignment * alignment
-
-    return try await rxSocket.receiveMessages(count: count, capacity: 32)
-      .compactMap { message in
-        // keep the socket, and hence its group memberships, alive for the sequence's lifetime
-        _ = rxSocket
-        return try? message.buffer.withParserSpan { input in
-          try IEEE802Packet(parsing: &input)
-        }
-      }.eraseToAnyAsyncSequence()
+    try _socket.receive(etherTypes: etherTypes, groupAddresses: groupAddresses, subtypes: subtypes)
+      .eraseToAnyAsyncSequence()
   }
 
   public func send(_ packet: IEEE802Packet) async throws {
@@ -309,7 +289,216 @@ public final class RawEthernetPort: Sendable, CustomStringConvertible {
       index: interface.index
     )
     let name = withUnsafeBytes(of: &address) { Array($0) }
-    try await _txSocket.sendMessage(Message(name: name, buffer: packet.serialized()))
+    let buffer = try packet.serialized()
+    do {
+      try await _socket.socket.sendMessage(Message(name: name, buffer: buffer))
+    } catch let error as Errno where error == .networkDown {
+      // a packet socket bound to an interface keeps ENETDOWN pending from when the interface last
+      // went down, and the next send reports it even if the interface has come back up; reporting
+      // clears it, so retry once, which fails again only if the interface is still down
+      try await _socket.socket.sendMessage(Message(name: name, buffer: buffer))
+    }
+  }
+}
+
+/// One `receivePackets()` sequence: the frames it wants, and where they go.
+private struct _Receiver: Sendable {
+  let etherTypes: [UInt16]
+  let subtypes: [UInt16: [ClosedRange<UInt8>]]
+  let groupAddresses: [EUI48]
+  let continuation: AsyncThrowingStream<IEEE802Packet, Error>.Continuation
+
+  func matches(_ packet: IEEE802Packet) -> Bool {
+    guard etherTypes.contains(packet.etherType) else { return false }
+    guard let ranges = subtypes[packet.etherType] else { return true }
+    guard let subtype = packet.payload.first else { return false }
+    return ranges.contains { $0.contains(subtype) }
+  }
+}
+
+private struct _ReceiveState: Sendable {
+  var receivers = [UInt64: _Receiver]()
+  var nextReceiverID: UInt64 = 0
+  var isBound = false
+  var isPortReleased = false
+  var receiveTask: Task<(), Never>?
+}
+
+/// A port's packet socket, and the receivers sharing its frames. It outlives the port while any
+/// receiver remains.
+private final class _PacketSocket: Sendable {
+  let socket: Socket
+
+  private let _interface: EthernetInterface
+  private let _state = Mutex(_ReceiveState())
+
+  init(interface: EthernetInterface, ring: IORing) throws {
+    _interface = interface
+    // with protocol 0 the socket receives nothing until bind(), by when a filter is attached, so
+    // no unfiltered frame leaks in; a port that only sends never binds it
+    socket = try Socket(
+      ring: ring,
+      domain: sa_family_t(AF_PACKET),
+      type: SOCK_RAW,
+      protocol: 0
+    )
+  }
+
+  func receive(
+    etherTypes: [UInt16],
+    groupAddresses: [EUI48],
+    subtypes: [UInt16: [ClosedRange<UInt8>]]
+  ) throws -> AsyncThrowingStream<IEEE802Packet, Error> {
+    let (stream, continuation) = AsyncThrowingStream.makeStream(
+      of: IEEE802Packet.self,
+      throwing: Error.self,
+      bufferingPolicy: .bufferingOldest(_receiveQueueLength)
+    )
+    let id = _state.withLock { state in
+      defer { state.nextReceiverID += 1 }
+      return state.nextReceiverID
+    }
+    // set before the receiver is added, so that however its sequence ends, it's removed
+    continuation.onTermination = { [weak self] _ in
+      self?._removeReceiver(id: id)
+    }
+
+    try _state.withLock { state in
+      state.receivers[id] = _Receiver(
+        etherTypes: etherTypes,
+        subtypes: subtypes,
+        groupAddresses: groupAddresses,
+        continuation: continuation
+      )
+      var joinedGroupAddresses = [EUI48]()
+      do {
+        try _attachFilter(for: state.receivers)
+        if !state.isBound {
+          try socket.bind(to: makeLinkLayerAddress(
+            macAddress: _interface.macAddress,
+            etherType: UInt16(ETH_P_ALL),
+            packetType: UInt8(PACKET_MULTICAST),
+            index: _interface.index
+          ))
+          state.isBound = true
+        }
+        for groupAddress in groupAddresses {
+          try socket.addMulticastMembership(for: makeLinkLayerAddress(
+            macAddress: groupAddress,
+            index: _interface.index
+          ))
+          joinedGroupAddresses.append(groupAddress)
+        }
+      } catch {
+        state.receivers[id] = nil
+        _leave(joinedGroupAddresses)
+        try? _attachFilter(for: state.receivers)
+        throw error
+      }
+
+      if state.receiveTask == nil {
+        // an error left pending by an earlier receive task reports a past event, such as the
+        // interface having gone down, and would end this receiver at once
+        _ = try? socket.getIntegerOption(option: SO_ERROR)
+        state.receiveTask = Task { await self._receive() }
+      }
+    }
+    return stream
+  }
+
+  func portReleased() {
+    _state.withLock { state in
+      state.isPortReleased = true
+      if state.receivers.isEmpty { _stopReceiving(&state) }
+    }
+  }
+
+  private func _removeReceiver(id: UInt64) {
+    _state.withLock { state in
+      guard let receiver = state.receivers.removeValue(forKey: id) else { return }
+      // the kernel counts a socket's joins of a group, so a group another receiver joined stays
+      // joined. Failing to leave or narrow (because the interface has gone, say) leaves the socket
+      // admitting more than it need, which matching each frame to its receivers still corrects.
+      _leave(receiver.groupAddresses)
+      try? _attachFilter(for: state.receivers)
+      if state.isPortReleased, state.receivers.isEmpty { _stopReceiving(&state) }
+    }
+  }
+
+  private func _stopReceiving(_ state: inout _ReceiveState) {
+    state.receiveTask?.cancel()
+    state.receiveTask = nil
+  }
+
+  private func _leave(_ groupAddresses: [EUI48]) {
+    for groupAddress in groupAddresses {
+      try? socket.dropMulticastMembership(for: makeLinkLayerAddress(
+        macAddress: groupAddress,
+        index: _interface.index
+      ))
+    }
+  }
+
+  /// Attaches a filter admitting the frames any of `receivers` wants (with none, nothing). The
+  /// socket sends as well as receives, so the kernel already keeps its own frames from it, and
+  /// outgoing frames are those of other senders.
+  private func _attachFilter(for receivers: [UInt64: _Receiver]) throws {
+    var etherTypes = [UInt16]()
+    var subtypes = [UInt16: [ClosedRange<UInt8>]]()
+    var etherTypesWithAnySubtype = Set<UInt16>()
+    for receiver in receivers.values {
+      for etherType in receiver.etherTypes {
+        if !etherTypes.contains(etherType) { etherTypes.append(etherType) }
+        if let ranges = receiver.subtypes[etherType] {
+          if !etherTypesWithAnySubtype.contains(etherType) {
+            subtypes[etherType, default: []] += ranges
+          }
+        } else {
+          etherTypesWithAnySubtype.insert(etherType)
+          subtypes[etherType] = nil
+        }
+      }
+    }
+    try socket.attachFilter(makeEtherTypeFilter(
+      etherTypes: etherTypes,
+      subtypes: subtypes,
+      dropsOutgoing: false
+    ))
+  }
+
+  private func _receive() async {
+    // io_uring requires the buffer size to be aligned to its recvmsg header
+    let alignment = MemoryLayout<UInt64>.alignment
+    let frameSize = _interface.mtu + _ethernetHeaderLength + _vlanTagLength
+    let count = (frameSize + alignment - 1) / alignment * alignment
+
+    var receiveError: (any Error)?
+    do {
+      let messages = try await socket.receiveMessages(count: count, capacity: _receiveBufferCount)
+      for try await message in messages {
+        guard let packet = try? message.buffer.withParserSpan({ input in
+          try IEEE802Packet(parsing: &input)
+        }) else { continue }
+        let continuations = _state.withLock { state in
+          state.receivers.values.filter { $0.matches(packet) }.map(\.continuation)
+        }
+        for continuation in continuations {
+          continuation.yield(packet)
+        }
+      }
+    } catch {
+      receiveError = error
+    }
+
+    // end the receivers as each would have ended on a socket of its own; a later receiver starts a
+    // new receive task
+    let receivers = _state.withLock { state in
+      state.receiveTask = nil
+      return Array(state.receivers.values)
+    }
+    for receiver in receivers {
+      receiver.continuation.finish(throwing: receiveError)
+    }
   }
 }
 
