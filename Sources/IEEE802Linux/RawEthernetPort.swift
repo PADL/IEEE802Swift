@@ -27,32 +27,143 @@ import SocketAddress
 import struct SystemPackage.Errno
 
 // Ethernet header (destination, source, EtherType) plus room for one 802.1Q tag.
-private let _ethernetHeaderLength = 14
+private let _ethernetHeaderLength = Int(ETH_HLEN)
 private let _vlanTagLength = 4
 
-/// Classic-BPF (SO_ATTACH_FILTER) accepting only ingress frames whose EtherType is in
-/// `etherTypes` and dropping our own TX (PACKET_OUTGOING); lets an ETH_P_ALL socket narrow
-/// in-kernel.
-public func makeEtherTypeFilter(etherTypes: [UInt16]) -> [SocketFilter] {
-  // opcodes: BPF_LD|B|ABS=0x30, BPF_LD|H|ABS=0x28, BPF_JMP|JEQ|K=0x15, BPF_RET|K=0x06
-  let n = etherTypes.count
-  var program: [SocketFilter] = [
-    SocketFilter(
-      code: 0x30,
-      jt: 0,
-      jf: 0,
-      k: 0xFFFF_F000 &+ 4
-    ), // A = skb->pkt_type (SKF_AD_PKTTYPE)
-    SocketFilter(code: 0x15, jt: UInt8(n + 1), jf: 0, k: UInt32(PACKET_OUTGOING)), // drop our TX
-    SocketFilter(code: 0x28, jt: 0, jf: 0, k: 12), // A = EtherType (offset 12)
-  ]
-  for (i, etherType) in etherTypes.enumerated() {
-    // match -> jump past the remaining tests to the accept; else fall through
-    program.append(SocketFilter(code: 0x15, jt: UInt8(n - i), jf: 0, k: UInt32(etherType)))
+// the EtherType follows the destination and source addresses; the first payload octet (for AVTP, the
+// subtype) follows the EtherType
+private let _etherTypeOffset = UInt32(2 * ETH_ALEN)
+private let _subtypeOffset = UInt32(ETH_HLEN)
+
+// classic-BPF instructions (linux/bpf_common.h) and ancillary loads (linux/filter.h)
+private let _bpfLoadByte = UInt16(BPF_LD | BPF_B | BPF_ABS)
+private let _bpfLoadHalfWord = UInt16(BPF_LD | BPF_H | BPF_ABS)
+private let _bpfJumpIfEqual = UInt16(BPF_JMP | BPF_JEQ | BPF_K)
+private let _bpfJumpIfGreater = UInt16(BPF_JMP | BPF_JGT | BPF_K)
+private let _bpfJumpIfGreaterOrEqual = UInt16(BPF_JMP | BPF_JGE | BPF_K)
+private let _bpfReturn = UInt16(BPF_RET | BPF_K)
+private let _bpfPacketTypeOffset = UInt32(bitPattern: Int32(SKF_AD_OFF + SKF_AD_PKTTYPE))
+private let _bpfVLANTagPresentOffset = UInt32(bitPattern: Int32(SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT))
+private let _bpfVLANTagAbsent: UInt32 = 0
+
+// a filter returns how many bytes of the frame to keep: none drops it, and anything at least as long
+// as the longest frame keeps it whole
+private let _bpfDropFrame: UInt32 = 0
+private let _bpfAcceptFrame: UInt32 = 0x0004_0000
+
+/// Assembles a classic-BPF program whose jumps name labels. Classic BPF only jumps forward, by at
+/// most `UInt8.max` instructions, so each label must be placed after, and near, the jumps to it.
+private struct _SocketFilterAssembler {
+  typealias Label = Int
+
+  private var _instructions = [(code: UInt16, k: UInt32, jt: Label?, jf: Label?)]()
+  private var _labelPositions = [Label: Int]()
+  private var _labelCount = 0
+
+  mutating func makeLabel() -> Label {
+    defer { _labelCount += 1 }
+    return _labelCount
   }
-  program.append(SocketFilter(code: 0x06, jt: 0, jf: 0, k: 0)) // drop
-  program.append(SocketFilter(code: 0x06, jt: 0, jf: 0, k: 0x0004_0000)) // accept
-  return program
+
+  mutating func place(_ label: Label) {
+    _labelPositions[label] = _instructions.count
+  }
+
+  mutating func load(_ code: UInt16, offset: UInt32) {
+    _instructions.append((code: code, k: offset, jt: nil, jf: nil))
+  }
+
+  /// Jumps to `ifTrue` or `ifFalse` on the comparison; a nil label falls through.
+  mutating func jump(_ code: UInt16, _ k: UInt32, ifTrue: Label? = nil, ifFalse: Label? = nil) {
+    _instructions.append((code: code, k: k, jt: ifTrue, jf: ifFalse))
+  }
+
+  mutating func `return`(_ length: UInt32) {
+    _instructions.append((code: _bpfReturn, k: length, jt: nil, jf: nil))
+  }
+
+  func assembled() -> [SocketFilter] {
+    _instructions.enumerated().map { index, instruction in
+      func offset(to label: Label?) -> UInt8 {
+        guard let label else { return 0 }
+        guard let position = _labelPositions[label] else {
+          preconditionFailure("socket filter jumps to an unplaced label")
+        }
+        let offset = position - (index + 1)
+        precondition(offset >= 0 && offset <= Int(UInt8.max), "socket filter jump out of range")
+        return UInt8(offset)
+      }
+      return SocketFilter(
+        code: instruction.code,
+        jt: offset(to: instruction.jt),
+        jf: offset(to: instruction.jf),
+        k: instruction.k
+      )
+    }
+  }
+}
+
+/// A classic-BPF program (SO_ATTACH_FILTER) accepting only frames whose EtherType is one of
+/// `etherTypes`, letting an ETH_P_ALL packet socket narrow what the kernel queues to it.
+///
+/// - Parameters:
+///   - etherTypes: the EtherTypes to accept.
+///   - subtypes: for any EtherType listed here, the values of the first octet after the EtherType
+///     to accept (for AVTP, the subtype: ATDECC control and AVTP stream data share an EtherType);
+///     frames with any other value, or with no payload, are dropped. An EtherType absent here
+///     accepts any payload.
+///   - dropsVLANTagged: drop frames that arrived with an 802.1Q tag. The kernel removes the tag
+///     before a packet socket sees a received frame, so the EtherType can't reveal it.
+///   - dropsOutgoing: drop the frames this host transmits (PACKET_OUTGOING). A filter can't tell
+///     which socket sent a frame, so this hides those of every other socket and process too. The
+///     kernel never loops a frame back to the packet socket that sent it, so a socket that both
+///     sends and receives can pass false to see other senders on this host without seeing itself.
+public func makeEtherTypeFilter(
+  etherTypes: [UInt16],
+  subtypes: [UInt16: [ClosedRange<UInt8>]] = [:],
+  dropsVLANTagged: Bool = false,
+  dropsOutgoing: Bool = true
+) -> [SocketFilter] {
+  var assembler = _SocketFilterAssembler()
+  let accept = assembler.makeLabel()
+  let drop = assembler.makeLabel()
+
+  if dropsOutgoing {
+    assembler.load(_bpfLoadByte, offset: _bpfPacketTypeOffset)
+    assembler.jump(_bpfJumpIfEqual, UInt32(PACKET_OUTGOING), ifTrue: drop)
+  }
+  if dropsVLANTagged {
+    assembler.load(_bpfLoadByte, offset: _bpfVLANTagPresentOffset)
+    assembler.jump(_bpfJumpIfEqual, _bpfVLANTagAbsent, ifFalse: drop)
+  }
+
+  // an EtherType without subtypes accepts at once; one with them checks its subtype further on
+  assembler.load(_bpfLoadHalfWord, offset: _etherTypeOffset)
+  let subtypeChecks = etherTypes.map { etherType in
+    (etherType, subtypes[etherType].map { ($0, assembler.makeLabel()) })
+  }
+  for (etherType, subtypeCheck) in subtypeChecks {
+    assembler.jump(_bpfJumpIfEqual, UInt32(etherType), ifTrue: subtypeCheck?.1 ?? accept)
+  }
+  assembler.place(drop)
+  assembler.return(_bpfDropFrame)
+
+  for case let (_, (ranges, label)?) in subtypeChecks {
+    assembler.place(label)
+    // a frame too short to have a subtype ends the program, dropping it
+    assembler.load(_bpfLoadByte, offset: _subtypeOffset)
+    for range in ranges {
+      let nextRange = assembler.makeLabel()
+      assembler.jump(_bpfJumpIfGreaterOrEqual, UInt32(range.lowerBound), ifFalse: nextRange)
+      assembler.jump(_bpfJumpIfGreater, UInt32(range.upperBound), ifTrue: nextRange, ifFalse: accept)
+      assembler.place(nextRange)
+    }
+    assembler.return(_bpfDropFrame)
+  }
+
+  assembler.place(accept)
+  assembler.return(_bpfAcceptFrame)
+  return assembler.assembled()
 }
 
 public func makeLinkLayerAddress(
@@ -146,10 +257,13 @@ public final class RawEthernetPort: Sendable, CustomStringConvertible {
 
   /// Opens a receive socket that only sees frames with one of `etherTypes`, and joins each of
   /// `groupAddresses` so that the device's multicast filter (and any hardware-offloaded bridge
-  /// MDB) forwards them, without resorting to promiscuous mode.
+  /// MDB) forwards them, without resorting to promiscuous mode. `subtypes` further restricts an
+  /// EtherType to frames whose first payload octet is in one of its ranges; see
+  /// `makeEtherTypeFilter(etherTypes:subtypes:dropsVLANTagged:dropsOutgoing:)`.
   public func receivePackets(
     etherTypes: [UInt16],
-    groupAddresses: [EUI48]
+    groupAddresses: [EUI48],
+    subtypes: [UInt16: [ClosedRange<UInt8>]] = [:]
   ) async throws -> AnyAsyncSequence<IEEE802Packet> {
     // open with protocol 0 and attach the BPF before bind() enables capture, so no unfiltered
     // frames leak in the socket()->attachFilter() window
@@ -159,7 +273,7 @@ public final class RawEthernetPort: Sendable, CustomStringConvertible {
       type: SOCK_RAW,
       protocol: 0
     )
-    try rxSocket.attachFilter(makeEtherTypeFilter(etherTypes: etherTypes))
+    try rxSocket.attachFilter(makeEtherTypeFilter(etherTypes: etherTypes, subtypes: subtypes))
     try rxSocket.bind(to: makeLinkLayerAddress(
       macAddress: interface.macAddress,
       etherType: UInt16(ETH_P_ALL),

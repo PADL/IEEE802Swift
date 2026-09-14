@@ -58,5 +58,17 @@ let package = Package(
       dependencies: ["IEEE802"],
       swiftSettings: CommonSwiftSettings
     ),
+    .testTarget(
+      name: "IEEE802LinuxTests",
+      dependencies: [
+        "IEEE802",
+        "IEEE802Linux",
+        .product(name: "IORing", package: "IORingSwift", condition: LinuxOnly),
+        .product(name: "IORingUtils", package: "IORingSwift", condition: LinuxOnly),
+        .product(name: "CLinuxSockAddr", package: "SocketAddress", condition: LinuxOnly),
+        .product(name: "SystemPackage", package: "swift-system", condition: LinuxOnly),
+      ],
+      swiftSettings: CommonSwiftSettings
+    ),
   ]
 )
