@@ -25,7 +25,8 @@ let package = Package(
   ],
   dependencies: [
     .package(url: "https://github.com/apple/swift-system", from: "1.2.1"),
-    .package(url: "https://github.com/apple/swift-binary-parsing", from: "0.0.2"),
+    // pre-1.0, so a new minor version may break the API
+    .package(url: "https://github.com/apple/swift-binary-parsing", .upToNextMinor(from: "0.0.2")),
     .package(url: "https://github.com/PADL/IORingSwift", from: "2.0.0"),
     .package(url: "https://github.com/PADL/SocketAddress", from: "0.5.2"),
     .package(url: "https://github.com/lhoward/AsyncExtensions", from: "0.9.2"),
