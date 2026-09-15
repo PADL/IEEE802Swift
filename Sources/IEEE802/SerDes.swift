@@ -35,62 +35,127 @@ public protocol Deserializble: Sendable, ExpressibleByParsing {
 
 public protocol SerDes: Serializable, Deserializble {}
 
+/// Serializes values in network byte order into a growing array.
+///
+/// Integers and MAC addresses are written directly into the array, without an intermediate
+/// array per value, and every method is inlinable so that callers in other modules can
+/// specialize them.
 public struct SerializationContext {
-  public private(set) var bytes = [UInt8]()
+  @usableFromInline
+  var _bytes = [UInt8]()
 
   public init() {}
 
+  @inlinable
+  public var bytes: [UInt8] { _bytes }
+
+  @inlinable
+  public var position: Int { _bytes.count }
+
+  @inlinable
   public mutating func reserveCapacity(_ capacity: Int) {
-    bytes.reserveCapacity(capacity)
+    _bytes.reserveCapacity(capacity)
   }
 
+  /// Appends `bytes`, or overwrites the bytes already serialized from `index`.
+  @inlinable
   public mutating func serialize(_ bytes: [UInt8], at index: Int? = nil) {
     if let index {
-      precondition(self.bytes.count >= index + bytes.count)
-      self.bytes.replaceSubrange(index..<(index + bytes.count), with: bytes)
+      precondition(_bytes.count >= index + bytes.count)
+      _bytes.replaceSubrange(index..<(index + bytes.count), with: bytes)
     } else {
-      self.bytes += bytes
+      _bytes += bytes
     }
   }
 
+  @inlinable
+  public mutating func serialize(contentsOf bytes: some Sequence<UInt8>) {
+    _bytes.append(contentsOf: bytes)
+  }
+
+  /// Appends `count` copies of `byte`, such as padding or a reserved field.
+  @inlinable
+  public mutating func serialize(repeating byte: UInt8, count: Int) {
+    precondition(count >= 0)
+    _bytes.append(addingCapacity: count) { output in
+      for _ in 0..<count {
+        output.append(byte)
+      }
+    }
+  }
+
+  @inlinable
   public mutating func serialize(uint8: UInt8, at index: Int? = nil) {
-    serialize([uint8], at: index)
+    _serialize(bigEndian: uint8, at: index)
   }
 
+  @inlinable
   public mutating func serialize(uint16: UInt16, at index: Int? = nil) {
-    serialize(uint16.bigEndianBytes, at: index)
+    _serialize(bigEndian: uint16, at: index)
   }
 
+  @inlinable
   public mutating func serialize(uint32: UInt32, at index: Int? = nil) {
-    serialize(uint32.bigEndianBytes, at: index)
+    _serialize(bigEndian: uint32, at: index)
   }
 
+  @inlinable
   public mutating func serialize(uint64: UInt64, at index: Int? = nil) {
-    serialize(uint64.bigEndianBytes, at: index)
+    _serialize(bigEndian: uint64, at: index)
   }
 
+  @inlinable
   public mutating func serialize(int8: Int8, at index: Int? = nil) {
-    serialize([UInt8(bitPattern: int8)], at: index)
+    _serialize(bigEndian: int8, at: index)
   }
 
+  @inlinable
   public mutating func serialize(int16: Int16, at index: Int? = nil) {
-    serialize(int16.bigEndianBytes, at: index)
+    _serialize(bigEndian: int16, at: index)
   }
 
+  @inlinable
   public mutating func serialize(int32: Int32, at index: Int? = nil) {
-    serialize(int32.bigEndianBytes, at: index)
+    _serialize(bigEndian: int32, at: index)
   }
 
+  @inlinable
   public mutating func serialize(int64: Int64, at index: Int? = nil) {
-    serialize(int64.bigEndianBytes, at: index)
+    _serialize(bigEndian: int64, at: index)
   }
 
+  @inlinable
   public mutating func serialize(eui48: EUI48, at index: Int? = nil) {
-    let bytes = [eui48[0], eui48[1], eui48[2], eui48[3], eui48[4], eui48[5]]
-    serialize(bytes, at: index)
+    if let index {
+      precondition(_bytes.count >= index + eui48.count)
+      for offset in eui48.indices {
+        _bytes[index + offset] = eui48[offset]
+      }
+    } else {
+      _bytes.append(addingCapacity: eui48.count) { output in
+        for offset in eui48.indices {
+          output.append(eui48[offset])
+        }
+      }
+    }
   }
 
-  public var position: Int { bytes.count }
+  @inlinable
+  mutating func _serialize(bigEndian value: some FixedWidthInteger, at index: Int?) {
+    let count = value.bitWidth / 8
+    if let index {
+      precondition(_bytes.count >= index + count)
+      for offset in 0..<count {
+        _bytes[index + offset] = UInt8(truncatingIfNeeded: value >> ((count - 1 - offset) * 8))
+      }
+    } else {
+      _bytes.append(addingCapacity: count) { output in
+        for offset in 0..<count {
+          output.append(UInt8(truncatingIfNeeded: value >> ((count - 1 - offset) * 8)))
+        }
+      }
+    }
+  }
 }
 
 // https://forums.swift.org/t/string-format-behaves-differently-on-windows/65197/6

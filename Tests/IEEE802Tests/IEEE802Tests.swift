@@ -60,3 +60,62 @@ final class IEEE802Tests: XCTestCase {
     XCTAssertTrue(_isMulticast(macAddress: mac))
   }
 }
+
+final class SerializationContextTests: XCTestCase {
+  func testIntegersAreSerializedBigEndian() {
+    var context = SerializationContext()
+    context.serialize(uint8: 0x01)
+    context.serialize(uint16: 0x0203)
+    context.serialize(uint32: 0x0405_0607)
+    context.serialize(uint64: 0x0809_0A0B_0C0D_0E0F)
+    context.serialize(int8: -2)
+    context.serialize(int16: -3)
+    context.serialize(int32: -4)
+    context.serialize(int64: .min)
+    XCTAssertEqual(context.bytes, [
+      0x01,
+      0x02, 0x03,
+      0x04, 0x05, 0x06, 0x07,
+      0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+      0xFE,
+      0xFF, 0xFD,
+      0xFF, 0xFF, 0xFF, 0xFC,
+      0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ])
+    XCTAssertEqual(context.position, 30)
+  }
+
+  func testBytesAndMacAddressesAreAppended() {
+    var context = SerializationContext()
+    context.serialize([0xAA, 0xBB])
+    context.serialize(eui48: [0x91, 0xE0, 0xF0, 0x01, 0x00, 0x00])
+    context.serialize(contentsOf: "ab".utf8)
+    context.serialize(repeating: 0x00, count: 3)
+    context.serialize(repeating: 0xFF, count: 0)
+    XCTAssertEqual(
+      context.bytes,
+      [0xAA, 0xBB, 0x91, 0xE0, 0xF0, 0x01, 0x00, 0x00, 0x61, 0x62, 0x00, 0x00, 0x00]
+    )
+  }
+
+  func testSerializingAtAnIndexOverwritesInPlace() {
+    var context = SerializationContext()
+    context.serialize(repeating: 0x00, count: 24)
+    context.serialize(uint8: 0x01, at: 0)
+    context.serialize(uint16: 0x0203, at: 1)
+    context.serialize(uint32: 0x0405_0607, at: 3)
+    context.serialize(uint64: 0x0809_0A0B_0C0D_0E0F, at: 7)
+    context.serialize(eui48: [0x10, 0x11, 0x12, 0x13, 0x14, 0x15], at: 15)
+    context.serialize([0x16, 0x17], at: 21)
+    context.serialize(int8: -1, at: 23)
+    XCTAssertEqual(context.bytes, (0x01...0x17).map { UInt8($0) } + [0xFF])
+    XCTAssertEqual(context.position, 24)
+
+    // a length written back over its placeholder once the value it measures is known
+    var message = SerializationContext()
+    message.serialize(uint16: 0)
+    message.serialize(contentsOf: [0xAB, 0xCD, 0xEF])
+    message.serialize(uint16: UInt16(message.position - 2), at: 0)
+    XCTAssertEqual(message.bytes, [0x00, 0x03, 0xAB, 0xCD, 0xEF])
+  }
+}
