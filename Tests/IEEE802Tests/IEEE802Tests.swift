@@ -118,4 +118,25 @@ final class SerializationContextTests: XCTestCase {
     message.serialize(uint16: UInt16(message.position - 2), at: 0)
     XCTAssertEqual(message.bytes, [0x00, 0x03, 0xAB, 0xCD, 0xEF])
   }
+
+  func testTagControlFieldsAreSetIndependently() {
+    var tci = IEEE802Packet.TCI()
+    tci.vid = 2
+    tci.pcp = .VO
+    tci.dei = true
+    XCTAssertEqual(tci.tci, 0xB002)
+
+    // a field is replaced, not merged with its previous value
+    tci.pcp = .EE
+    XCTAssertEqual(tci.pcp, .EE)
+    tci.vid = 0xFFE
+    XCTAssertEqual(tci.vid, 0xFFE)
+    tci.vid = 1
+    XCTAssertEqual(tci.vid, 1)
+    tci.dei = false
+    XCTAssertEqual(tci.tci, 0x4001)
+
+    tci.pcp = .BK
+    XCTAssertEqual(tci.tci, 0x0001)
+  }
 }
