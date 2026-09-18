@@ -51,8 +51,8 @@ public struct IEEE802Packet: Sendable, CustomStringConvertible {
         PCP(rawValue: UInt8((tci & 0xE000) >> 13))!
       }
       set {
-        let value = UInt16(newValue.rawValue) << 13
-        tci |= value & 0xE000
+        tci &= ~0xE000
+        tci |= UInt16(newValue.rawValue) << 13
       }
     }
 
@@ -74,7 +74,7 @@ public struct IEEE802Packet: Sendable, CustomStringConvertible {
         tci & 0xFFF
       }
       set {
-        precondition(vid > 0 && vid < 0xFFF)
+        precondition(newValue > 0 && newValue < 0xFFF)
         tci &= ~0xFFF
         tci |= (newValue & 0xFFF)
       }
