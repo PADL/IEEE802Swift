@@ -29,7 +29,7 @@ let package = Package(
     .package(url: "https://github.com/apple/swift-binary-parsing", .upToNextMinor(from: "0.0.2")),
     .package(url: "https://github.com/PADL/IORingSwift", from: "2.0.0"),
     .package(url: "https://github.com/PADL/SocketAddress", from: "0.5.2"),
-    .package(url: "https://github.com/lhoward/AsyncExtensions", from: "0.9.2"),
+    .package(url: "https://github.com/lhoward/AsyncExtensions", from: "0.10.0"),
   ],
   targets: [
     .target(
