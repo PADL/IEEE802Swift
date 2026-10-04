@@ -27,9 +27,9 @@ let package = Package(
     .package(url: "https://github.com/apple/swift-system", from: "1.2.1"),
     // pre-1.0, so a new minor version may break the API
     .package(url: "https://github.com/apple/swift-binary-parsing", .upToNextMinor(from: "0.0.2")),
-    .package(url: "https://github.com/PADL/IORingSwift", from: "2.0.0"),
+    .package(url: "https://github.com/PADL/IORingSwift", from: "2.1.3"),
     .package(url: "https://github.com/PADL/SocketAddress", from: "0.5.2"),
-    .package(url: "https://github.com/lhoward/AsyncExtensions", from: "0.10.0"),
+    .package(url: "https://github.com/sideeffect-io/AsyncExtensions", from: "0.7.0"),
   ],
   targets: [
     .target(
